@@ -628,7 +628,7 @@ class RobloxTrackerBot(commands.Bot):
         self.flagsearch_command.binding = self
         self.send_missed_updates_command.binding = self
 
-    @app_commands.command(name="setup", description="Choose channels for FastFlag, API dump, and CppTree updates")
+    @app_commands.command(name="setup", description="Choose channels for FastFlag, API dump, CppTree, and deployment updates")
     @app_commands.guild_only()
     async def setup_command(self, interaction: discord.Interaction) -> None:
         if self.poster is None or interaction.guild_id is None:
