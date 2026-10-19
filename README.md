@@ -8,9 +8,10 @@ Tracks Roblox FastFlag changes and Roblox Client Tracker commits, with slash com
 - For each such commit, looks at exactly which individual `FVariables/{Prefix}/{Letter}/{Name}.json` files changed in that commit and reports each one by name with its old → new value, rather than dumping the raw JSON diff of the whole platform file.
 - State (last-seen commit sha) is saved to `data/state.json`, so it picks up exactly where it left off on restart.
 - Watches `API-Dump.json` and `CppTree.txt` in `MaximumADHD/Roblox-Client-Tracker` on the `roblox` branch.
-- `/setup` asks for FastFlag, API dump, and CppTree channels and saves the selected channel IDs per server.
+- `/setup` asks for FastFlag, API dump, CppTree, and deployment channels and saves the selected channel IDs per server.
 - `/flagsearch` takes `Client` or `Studio` plus a keyword, combines all relevant Roblox settings endpoints, and returns a private JSON attachment.
 - `/send-missed-updates` immediately delivers all commits missed by the saved per-source cursors, then records those commits as processed. It is safe to use while the normal polling loop is running.
+- Deployment updates come from `https://setup.rbxcdn.com/DeployHistory.txt` and are shown in a dedicated webhook-style embed with green new entries and red removed/reverted entries.
 
 ### Catching up after being offline
 

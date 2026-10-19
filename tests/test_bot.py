@@ -64,6 +64,16 @@ class HelperTests(unittest.TestCase):
         )
         self.assertEqual(bot.extract_application_settings({"FFlagPacket": "False"}), {"FFlagPacket": "False"})
 
+    def test_tracker_change_lines_reports_added_removed_and_modified_json_keys(self):
+        tracker = bot.GithubFileTracker(unittest.mock.Mock(), unittest.mock.Mock(), unittest.mock.Mock())
+        added, removed, modified = tracker.change_lines(
+            '{"Keep": "old", "Removed": false}',
+            '{"Keep": "new", "Added": true}',
+        )
+        self.assertEqual(added, ["Added: True"])
+        self.assertEqual(removed, ["Removed: False"])
+        self.assertEqual(modified, ["Keep: old -> new"])
+
 
 class StateStoreTests(unittest.TestCase):
     def test_load_save_and_set_round_trip_atomically(self):

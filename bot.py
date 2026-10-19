@@ -1,4 +1,5 @@
 import asyncio
+import difflib
 import io
 import json
 import logging
@@ -28,6 +29,7 @@ FFLAG_REPO = "MaximumADHD/Roblox-FFlag-Tracker"
 FFLAG_BRANCH = "main"
 TRACKER_REPO = "MaximumADHD/Roblox-Client-Tracker"
 TRACKER_BRANCH = "roblox"
+DEPLOY_HISTORY_URL = "https://setup.rbxcdn.com/DeployHistory.txt"
 
 CLIENT_SETTING_URLS = {
     "client": (
@@ -216,6 +218,7 @@ class DiscordPoster:
             "flags": os.getenv("CHANNEL_FLAGS", "flags-tracker"),
             "api": os.getenv("CHANNEL_API", "api-dumps"),
             "cpptree": os.getenv("CHANNEL_CPPTREE", "cpptree-updates"),
+            "deployments": os.getenv("CHANNEL_DEPLOYMENTS", "deployment-updates"),
         }
 
     def configured_channel_id(self, guild_id: int, key: str) -> int | None:
@@ -450,7 +453,40 @@ class FFlagTracker(CommitTracker):
 
 
 class GithubFileTracker(CommitTracker):
-    """Posts a current snapshot whenever a tracked file receives a commit."""
+    """Posts a colored added/removed summary whenever a tracked file changes."""
+
+    def change_lines(self, previous: str, current: str) -> tuple[list[str], list[str], list[str]]:
+        try:
+            old_data = json.loads(previous) if previous else {}
+            new_data = json.loads(current)
+            if isinstance(old_data, dict) and isinstance(new_data, dict):
+                added = [f"{key}: {new_data[key]}" for key in sorted(set(new_data) - set(old_data))]
+                removed = [f"{key}: {old_data[key]}" for key in sorted(set(old_data) - set(new_data))]
+                modified = [
+                    f"{key}: {old_data[key]} -> {new_data[key]}"
+                    for key in sorted(set(old_data) & set(new_data))
+                    if old_data[key] != new_data[key]
+                ]
+                return added, removed, modified
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+        added: list[str] = []
+        removed: list[str] = []
+        for line in difflib.ndiff(previous.splitlines(), current.splitlines()):
+            if line.startswith("+ "):
+                added.append(line[2:])
+            elif line.startswith("- "):
+                removed.append(line[2:])
+        return added, removed, []
+
+    @staticmethod
+    def change_field(name: str, values: list[str], emoji: str) -> str:
+        shown = values[:15]
+        text = "\n".join(f"`{short(value, 900)}`" for value in shown) or "None"
+        if len(values) > len(shown):
+            text += f"\n…and {len(values) - len(shown)} more"
+        return f"{emoji} **{name} ({len(values)})**\n{text}"
 
     async def run(self) -> list[Post]:
         posts: list[Post] = []
@@ -461,15 +497,29 @@ class GithubFileTracker(CommitTracker):
             if not touched:
                 continue
             snapshot = await self.github.raw(self.repo, sha, self.path)
+            parent_sha = (detail.get("parents") or [{}])[0].get("sha")
+            try:
+                previous = await self.github.raw(self.repo, parent_sha, self.path) if parent_sha else ""
+            except Exception:
+                previous = ""
+            added, removed, modified = self.change_lines(previous, snapshot)
             file_name = Path(self.path).name
             attachment = discord.File(io.BytesIO(snapshot.encode("utf-8")), filename=file_name)
+            color = ROBLOX_GREEN if added and not removed else 0xE74C3C if removed and not added else 0xF1C40F
             embed = discord.Embed(
                 title=f"{file_name} Update Detected",
-                description=f"A new commit updated `{self.path}`.",
-                color=ROBLOX_BLUE,
+                description="A new commit updated this tracked file. The snapshot is attached below.",
+                color=color,
                 url=detail.get("html_url"),
                 timestamp=datetime.now(timezone.utc),
             )
+            embed.add_field(name="Changes", value=f"🟢 Added: **{len(added)}**  🔴 Removed: **{len(removed)}**  🟡 Modified: **{len(modified)}**", inline=False)
+            if added:
+                embed.add_field(name="🟢 Added", value=short("\n".join(f"`{value}`" for value in added[:15]), 1024), inline=False)
+            if removed:
+                embed.add_field(name="🔴 Removed", value=short("\n".join(f"`{value}`" for value in removed[:15]), 1024), inline=False)
+            if modified:
+                embed.add_field(name="🟡 Modified", value=short("\n".join(f"`{value}`" for value in modified[:15]), 1024), inline=False)
             embed.add_field(name="Commit", value=f"`{sha[:12]}`", inline=True)
             embed.add_field(name="Source", value=f"[Roblox-Client-Tracker]({detail.get('html_url')})", inline=False)
             posts.append(Post(self.channel_key, embed, [attachment]))
@@ -492,13 +542,41 @@ class CppTreeTracker(GithubFileTracker):
     path = "CppTree.txt"
 
 
+class DeploymentTracker(Tracker):
+    key = "deployment_last_snapshot"
+    channel_key = "deployments"
+
+    async def run(self) -> list[Post]:
+        current = await self.http.text(DEPLOY_HISTORY_URL)
+        previous = self.state.get(self.key)
+        self.state.set(self.key, current)
+        if previous is None:
+            return []
+        added, removed, _ = GithubFileTracker(self.state, self.http, self.github).change_lines(previous, current)
+        if not added and not removed:
+            return []
+        embed = discord.Embed(
+            title="🚀 Roblox Deployment Update",
+            description="A new Roblox deployment was published.",
+            color=ROBLOX_GREEN if added and not removed else 0xE74C3C,
+            url=DEPLOY_HISTORY_URL,
+            timestamp=datetime.now(timezone.utc),
+        )
+        if added:
+            embed.add_field(name="🟢 New deployments", value=short("\n".join(added[-15:]), 1024), inline=False)
+        if removed:
+            embed.add_field(name="🔴 Removed/reverted entries", value=short("\n".join(removed[-15:]), 1024), inline=False)
+        embed.add_field(name="Source", value=f"[DeployHistory.txt]({DEPLOY_HISTORY_URL})", inline=False)
+        return [Post(self.channel_key, embed)]
+
+
 class ChannelSetupView(discord.ui.View):
     def __init__(self, bot: "RobloxTrackerBot", guild_id: int, step: int = 0) -> None:
         super().__init__(timeout=600)
         self.bot = bot
         self.guild_id = guild_id
         self.step = step
-        keys = [("flags", "FastFlag updates"), ("api", "API dumps"), ("cpptree", "CppTree updates")]
+        keys = [("flags", "FastFlag updates"), ("api", "API dumps"), ("cpptree", "CppTree updates"), ("deployments", "deployment updates")]
         key, label = keys[step]
         select = discord.ui.ChannelSelect(
             channel_types=[discord.ChannelType.text],
@@ -525,7 +603,7 @@ class ChannelSetupView(discord.ui.View):
                 )
             else:
                 await interaction.response.edit_message(
-                    content="Setup complete. FastFlag, API dump, and CppTree updates will be sent to the selected channels.",
+                    content="Setup complete. FastFlag, API dump, CppTree, and deployment updates will be sent to the selected channels.",
                     view=None,
                 )
 
@@ -651,11 +729,12 @@ class RobloxTrackerBot(commands.Bot):
             FFlagTracker(self.state, http, github),
             ApiDumpTracker(self.state, http, github),
             CppTreeTracker(self.state, http, github),
+            DeploymentTracker(self.state, http, github),
         ]
 
     async def poll_once(self) -> dict[str, int]:
         assert self.poster is not None
-        counts = {"FastFlags": 0, "API dumps": 0, "CppTree": 0}
+        counts = {"FastFlags": 0, "API dumps": 0, "CppTree": 0, "Deployments": 0}
         async with self.update_lock:
             for tracker in self.build_trackers():
                 try:
@@ -675,6 +754,8 @@ class RobloxTrackerBot(commands.Bot):
                             counts["API dumps"] += 1
                         elif isinstance(tracker, CppTreeTracker):
                             counts["CppTree"] += 1
+                        elif isinstance(tracker, DeploymentTracker):
+                            counts["Deployments"] += 1
                     except Exception:
                         # A single bad embed/send should not stop the rest of the
                         # batch, and definitely should not kill the poll loop.
