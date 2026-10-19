@@ -48,6 +48,9 @@ CLIENT_SETTING_URLS = {
 # offline. Keeps a long outage from triggering a backfill all the way into
 # ancient flag history.
 MAX_LOOKBACK_COMMITS = 200
+# Manual repair stays bounded so one large backlog cannot delay the other
+# sources. The normal background tracker still catches up using the full limit.
+MANUAL_REPLAY_COMMITS = 25
 
 
 def env_bool(name: str, default: bool = False) -> bool:
@@ -837,7 +840,7 @@ class RobloxTrackerBot(commands.Bot):
                 try:
                     if isinstance(tracker, CommitTracker):
                         seen = await self.poster.seen_commit_shas(tracker.channel_key)
-                        candidates = await tracker.recent_commits()
+                        candidates = await tracker.recent_commits(MANUAL_REPLAY_COMMITS)
                         commits = [item for item in candidates if item["sha"][:12] not in seen]
                         posts = await tracker.run(commits)
                     else:
