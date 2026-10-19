@@ -766,7 +766,7 @@ class RobloxTrackerBot(commands.Bot):
         # global registrations created by earlier versions so Discord does not
         # show every command twice.
         commands = list(self.tree.get_commands())
-        self.tree.clear_commands()
+        self.tree.clear_commands(guild=None)
         await self.tree.sync()
         for command in commands:
             self.tree.add_command(command)
