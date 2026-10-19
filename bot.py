@@ -692,9 +692,13 @@ class RobloxTrackerBot(commands.Bot):
         self.send_missed_updates_command.binding = self
 
     @app_commands.command(name="setup", description="Choose channels for FastFlag, API dump, and CppTree updates")
+    @app_commands.default_permissions(administrator=True)
     @app_commands.guild_only()
     async def setup_command(self, interaction: discord.Interaction) -> None:
-        if self.poster is None or interaction.guild_id is None:
+        if interaction.guild_id is None or not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message("Only server administrators can use /setup.", ephemeral=True)
+            return
+        if self.poster is None:
             await interaction.response.send_message("The bot is still starting up; try again in a moment.", ephemeral=True)
             return
         await interaction.response.send_message(
@@ -733,8 +737,12 @@ class RobloxTrackerBot(commands.Bot):
         )
 
     @app_commands.command(name="send-missed-updates", description="Send all missed FastFlag, API dump, and CppTree updates")
+    @app_commands.default_permissions(administrator=True)
     @app_commands.guild_only()
     async def send_missed_updates_command(self, interaction: discord.Interaction) -> None:
+        if interaction.guild_id is None or not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message("Only server administrators can use /send-missed-updates.", ephemeral=True)
+            return
         if self.poster is None:
             await interaction.response.send_message("The bot is still starting up; try again in a moment.", ephemeral=True)
             return
@@ -754,11 +762,14 @@ class RobloxTrackerBot(commands.Bot):
             "User-Agent": "RobloxDiscordTrackerBot/1.0",
         }
         self.session = aiohttp.ClientSession(headers=headers, timeout=aiohttp.ClientTimeout(total=45))
-        # A server may still have an older guild-scoped copy of these slash
-        # commands. Sync that scope explicitly so Discord replaces the stale
-        # signature instead of dispatching it to the new handler.
-        global_synced = await self.tree.sync()
-        logging.info("Synced %d global application commands", len(global_synced))
+        # This bot intentionally uses guild-scoped commands. Clear the old
+        # global registrations created by earlier versions so Discord does not
+        # show every command twice.
+        commands = list(self.tree.get_commands())
+        self.tree.clear_commands()
+        await self.tree.sync()
+        for command in commands:
+            self.tree.add_command(command)
         guild_id = os.getenv("DISCORD_GUILD_ID", "").strip()
         if guild_id:
             guild = discord.Object(id=int(guild_id))
@@ -785,6 +796,10 @@ class RobloxTrackerBot(commands.Bot):
                 self.tree.copy_global_to(guild=guild)
                 await self.tree.sync(guild=guild)
             logging.info("Discord channel report:\n%s", "\n".join(self.poster.channel_report()))
+            async def startup_progress(message: str) -> None:
+                logging.info("Startup missed-update repair: %s", message)
+
+            await self.send_missing_updates(startup_progress)
             self.poll_task = asyncio.create_task(self.poll_loop())
 
     def build_trackers(self) -> list[Tracker]:

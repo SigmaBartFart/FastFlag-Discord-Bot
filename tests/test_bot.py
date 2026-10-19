@@ -15,6 +15,8 @@ class HelperTests(unittest.TestCase):
         self.assertIs(instance.setup_command.binding, instance)
         self.assertIs(instance.flagsearch_command.binding, instance)
         self.assertIs(instance.send_missed_updates_command.binding, instance)
+        self.assertTrue(instance.setup_command.default_permissions.administrator)
+        self.assertTrue(instance.send_missed_updates_command.default_permissions.administrator)
         self.assertEqual(
             {command.name for command in instance.tree.get_commands()},
             {"setup", "flagsearch", "send-missed-updates"},
