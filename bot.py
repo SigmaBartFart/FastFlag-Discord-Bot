@@ -30,7 +30,6 @@ FFLAG_REPO = "MaximumADHD/Roblox-FFlag-Tracker"
 FFLAG_BRANCH = "main"
 TRACKER_REPO = "MaximumADHD/Roblox-Client-Tracker"
 TRACKER_BRANCH = "roblox"
-DEPLOY_HISTORY_URL = "https://setup.rbxcdn.com/DeployHistory.txt"
 
 CLIENT_SETTING_URLS = {
     "client": (
@@ -117,7 +116,11 @@ def fit_embed(embed: discord.Embed) -> discord.Embed:
 
 
 def change_summary_lines(added: list[str], removed: list[str], modified: list[str], limit: int = 40) -> str:
-    lines = [*(f"+ {value}" for value in added), *(f"- {value}" for value in removed), *(f"~ {value}" for value in modified)]
+    lines = [
+        *(f"+ {short(value, 260)}" for value in added),
+        *(f"- {short(value, 260)}" for value in removed),
+        *(f"~ {short(value, 260)}" for value in modified),
+    ]
     if len(lines) > limit:
         lines = lines[:limit] + [f"... and {len(lines) - limit} more changes"]
     return "\n".join(lines) or "No line-level changes detected."
@@ -259,7 +262,6 @@ class DiscordPoster:
             "flags": os.getenv("CHANNEL_FLAGS", "flags-tracker"),
             "api": os.getenv("CHANNEL_API", "api-dumps"),
             "cpptree": os.getenv("CHANNEL_CPPTREE", "cpptree-updates"),
-            "deployments": os.getenv("CHANNEL_DEPLOYMENTS", "deployment-updates"),
         }
 
     def configured_channel_id(self, guild_id: int, key: str) -> int | None:
@@ -527,10 +529,32 @@ class FFlagTracker(CommitTracker):
 class GithubFileTracker(CommitTracker):
     """Posts a colored added/removed summary whenever a tracked file changes."""
 
+    @staticmethod
+    def flatten_json(value: Any, prefix: str = "") -> dict[str, Any]:
+        """Flatten API-Dump's nested class/member objects into readable keys."""
+        if isinstance(value, dict):
+            result: dict[str, Any] = {}
+            base = prefix
+            for key, child in value.items():
+                if key == "Name":
+                    continue
+                child_prefix = f"{base}.{key}" if base else key
+                result.update(GithubFileTracker.flatten_json(child, child_prefix))
+            return result
+        if isinstance(value, list):
+            result = {}
+            for index, child in enumerate(value):
+                child_prefix = f"{prefix}[{index}]"
+                if isinstance(child, dict) and child.get("Name"):
+                    child_prefix = f"{prefix}.{child['Name']}"
+                result.update(GithubFileTracker.flatten_json(child, child_prefix))
+            return result
+        return {prefix: value}
+
     def change_lines(self, previous: str, current: str) -> tuple[list[str], list[str], list[str]]:
         try:
-            old_data = json.loads(previous) if previous else {}
-            new_data = json.loads(current)
+            old_data = self.flatten_json(json.loads(previous) if previous else {})
+            new_data = self.flatten_json(json.loads(current))
             if isinstance(old_data, dict) and isinstance(new_data, dict):
                 added = [f"{key}: {new_data[key]}" for key in sorted(set(new_data) - set(old_data))]
                 removed = [f"{key}: {old_data[key]}" for key in sorted(set(old_data) - set(new_data))]
@@ -609,38 +633,13 @@ class CppTreeTracker(GithubFileTracker):
     path = "CppTree.txt"
 
 
-class DeploymentTracker(Tracker):
-    key = "deployment_last_snapshot"
-    channel_key = "deployments"
-
-    async def run(self) -> list[Post]:
-        current = await self.http.text(DEPLOY_HISTORY_URL)
-        previous = self.state.get(self.key)
-        self.state.set(self.key, current)
-        if previous is None:
-            return []
-        added, removed, _ = GithubFileTracker(self.state, self.http, self.github).change_lines(previous, current)
-        if not added and not removed:
-            return []
-        embed = discord.Embed(
-            title="🚀 Roblox Deployment Update",
-            description=code_block(change_summary_lines(added, removed, []), "diff"),
-            color=ROBLOX_GREEN if added and not removed else 0xE74C3C,
-            url=DEPLOY_HISTORY_URL,
-            timestamp=datetime.now(timezone.utc),
-        )
-        embed.add_field(name="Changes", value=f"+ {len(added)} added  - {len(removed)} removed", inline=False)
-        embed.add_field(name="Source", value=f"[DeployHistory.txt]({DEPLOY_HISTORY_URL})", inline=False)
-        return [Post(self.channel_key, embed)]
-
-
 class ChannelSetupView(discord.ui.View):
     def __init__(self, bot: "RobloxTrackerBot", guild_id: int, step: int = 0) -> None:
         super().__init__(timeout=600)
         self.bot = bot
         self.guild_id = guild_id
         self.step = step
-        keys = [("flags", "FastFlag updates"), ("api", "API dumps"), ("cpptree", "CppTree updates"), ("deployments", "deployment updates")]
+        keys = [("flags", "FastFlag updates"), ("api", "API dumps"), ("cpptree", "CppTree updates")]
         key, label = keys[step]
         select = discord.ui.ChannelSelect(
             channel_types=[discord.ChannelType.text],
@@ -667,7 +666,7 @@ class ChannelSetupView(discord.ui.View):
                 )
             else:
                 await interaction.response.edit_message(
-                    content="Setup complete. FastFlag, API dump, CppTree, and deployment updates will be sent to the selected channels.",
+                    content="Setup complete. FastFlag, API dump, and CppTree updates will be sent to the selected channels.",
                     view=None,
                 )
 
@@ -692,7 +691,7 @@ class RobloxTrackerBot(commands.Bot):
         self.flagsearch_command.binding = self
         self.send_missed_updates_command.binding = self
 
-    @app_commands.command(name="setup", description="Choose channels for FastFlag, API dump, CppTree, and deployment updates")
+    @app_commands.command(name="setup", description="Choose channels for FastFlag, API dump, and CppTree updates")
     @app_commands.guild_only()
     async def setup_command(self, interaction: discord.Interaction) -> None:
         if self.poster is None or interaction.guild_id is None:
@@ -733,7 +732,7 @@ class RobloxTrackerBot(commands.Bot):
             f"Found **{len(results)}** matching {platform.name} FastFlags.", file=file, ephemeral=True
         )
 
-    @app_commands.command(name="send-missed-updates", description="Send all missed FastFlag, API dump, CppTree, and deployment updates")
+    @app_commands.command(name="send-missed-updates", description="Send all missed FastFlag, API dump, and CppTree updates")
     @app_commands.guild_only()
     async def send_missed_updates_command(self, interaction: discord.Interaction) -> None:
         if self.poster is None:
@@ -796,12 +795,11 @@ class RobloxTrackerBot(commands.Bot):
             FFlagTracker(self.state, http, github),
             ApiDumpTracker(self.state, http, github),
             CppTreeTracker(self.state, http, github),
-            DeploymentTracker(self.state, http, github),
         ]
 
     async def poll_once(self) -> dict[str, int]:
         assert self.poster is not None
-        counts = {"FastFlags": 0, "API dumps": 0, "CppTree": 0, "Deployments": 0}
+        counts = {"FastFlags": 0, "API dumps": 0, "CppTree": 0}
         async with self.update_lock:
             for tracker in self.build_trackers():
                 try:
@@ -823,8 +821,6 @@ class RobloxTrackerBot(commands.Bot):
                                 counts["API dumps"] += 1
                             elif isinstance(tracker, CppTreeTracker):
                                 counts["CppTree"] += 1
-                            elif isinstance(tracker, DeploymentTracker):
-                                counts["Deployments"] += 1
                     except Exception:
                         # A single bad embed/send should not stop the rest of the
                         # batch, and definitely should not kill the poll loop.
@@ -837,7 +833,7 @@ class RobloxTrackerBot(commands.Bot):
     async def send_missing_updates(self, progress: Callable[[str], Awaitable[None]] | None = None) -> dict[str, int]:
         """Repair channels from recent source history without trusting cursors."""
         assert self.poster is not None
-        counts = {"FastFlags": 0, "API dumps": 0, "CppTree": 0, "Deployments": 0}
+        counts = {"FastFlags": 0, "API dumps": 0, "CppTree": 0}
         async with self.update_lock:
             for tracker in self.build_trackers():
                 try:
@@ -845,7 +841,6 @@ class RobloxTrackerBot(commands.Bot):
                         FFlagTracker: "FastFlags",
                         ApiDumpTracker: "API dumps",
                         CppTreeTracker: "CppTree",
-                        DeploymentTracker: "Deployments",
                     }.get(type(tracker), tracker.__class__.__name__)
                     if progress:
                         await progress(f"Checking {source_name} channel history...")
@@ -857,8 +852,6 @@ class RobloxTrackerBot(commands.Bot):
                             await progress(f"{source_name}: found {len(commits)} missing of the latest {len(candidates)} commits; preparing updates...")
                         posts = await tracker.run(commits)
                     else:
-                        if progress:
-                            await progress(f"{source_name}: checking the latest deployment history...")
                         posts = await tracker.run()
                 except GithubRateLimited as exc:
                     logging.warning("%s skipped: %s", tracker.__class__.__name__, exc)
@@ -877,8 +870,6 @@ class RobloxTrackerBot(commands.Bot):
                                 counts["API dumps"] += 1
                             elif isinstance(tracker, CppTreeTracker):
                                 counts["CppTree"] += 1
-                            elif isinstance(tracker, DeploymentTracker):
-                                counts["Deployments"] += 1
                     except Exception:
                         logging.exception("Failed to repair a post for %s", tracker.__class__.__name__)
                     if sent:
