@@ -82,6 +82,36 @@ def make_text_file(name: str, text: str) -> discord.File | None:
     return discord.File(str(path), filename=name)
 
 
+def embed_characters(embed: discord.Embed) -> int:
+    total = len(embed.title or "") + len(embed.description or "")
+    total += len(embed.footer.text or "") if embed.footer else 0
+    total += len(embed.author.name or "") if embed.author else 0
+    total += sum(len(field.name) + len(field.value) for field in embed.fields)
+    return total
+
+
+def fit_embed(embed: discord.Embed) -> discord.Embed:
+    """Keep generated update embeds under Discord's 6000-character limit."""
+    if embed_characters(embed) <= 6000:
+        return embed
+    embed.description = short(embed.description or "", 2200)
+    original_fields = list(embed.fields)
+    embed.clear_fields()
+    for field in original_fields:
+        embed.add_field(
+            name=short(field.name, 200),
+            value=short(field.value, 850),
+            inline=field.inline,
+        )
+    if embed_characters(embed) > 6000:
+        embed.description = short(embed.description or "", 1200)
+        original_fields = list(embed.fields)
+        embed.clear_fields()
+        for field in original_fields[:6]:
+            embed.add_field(name=short(field.name, 150), value=short(field.value, 600), inline=field.inline)
+    return embed
+
+
 class StateStore:
     def __init__(self, path: Path) -> None:
         self.path = path
@@ -266,7 +296,7 @@ class DiscordPoster:
 
         files = post.files or []
         try:
-            await channel.send(embed=post.embed, files=files)
+            await channel.send(embed=fit_embed(post.embed), files=files)
         finally:
             for file in files:
                 file.close()
@@ -777,8 +807,10 @@ class RobloxTrackerBot(commands.Bot):
                     logging.exception("%s failed", tracker.__class__.__name__)
                     continue
                 for post in posts:
+                    sent = False
                     try:
                         await self.poster.send(post)
+                        sent = True
                         if isinstance(tracker, FFlagTracker):
                             counts["FastFlags"] += 1
                         elif isinstance(tracker, ApiDumpTracker):
@@ -792,7 +824,8 @@ class RobloxTrackerBot(commands.Bot):
                         # batch, and definitely should not kill the poll loop.
                         logging.exception("Failed to send a post for %s", tracker.__class__.__name__)
                     # Discord's per-channel bucket is ~5 messages / 5 seconds.
-                    await asyncio.sleep(0.4)
+                    if sent:
+                        await asyncio.sleep(0.4)
         return counts
 
     async def send_missing_updates(self) -> dict[str, int]:
@@ -816,8 +849,10 @@ class RobloxTrackerBot(commands.Bot):
                     logging.exception("%s missed-update repair failed", tracker.__class__.__name__)
                     continue
                 for post in posts:
+                    sent = False
                     try:
                         await self.poster.send(post)
+                        sent = True
                         if isinstance(tracker, FFlagTracker):
                             counts["FastFlags"] += 1
                         elif isinstance(tracker, ApiDumpTracker):
@@ -828,7 +863,8 @@ class RobloxTrackerBot(commands.Bot):
                             counts["Deployments"] += 1
                     except Exception:
                         logging.exception("Failed to repair a post for %s", tracker.__class__.__name__)
-                    await asyncio.sleep(0.4)
+                    if sent:
+                        await asyncio.sleep(0.4)
         return counts
 
     async def poll_loop(self) -> None:

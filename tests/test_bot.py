@@ -74,6 +74,13 @@ class HelperTests(unittest.TestCase):
         self.assertEqual(removed, ["Removed: False"])
         self.assertEqual(modified, ["Keep: old -> new"])
 
+    def test_fit_embed_keeps_large_update_under_discord_limit(self):
+        embed = bot.discord.Embed(title="Update", description="x" * 10000)
+        for index in range(10):
+            embed.add_field(name=f"Field {index}", value="y" * 1000)
+        fitted = bot.fit_embed(embed)
+        self.assertLessEqual(bot.embed_characters(fitted), 6000)
+
 
 class StateStoreTests(unittest.TestCase):
     def test_load_save_and_set_round_trip_atomically(self):
