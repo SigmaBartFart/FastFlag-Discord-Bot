@@ -6,6 +6,7 @@ import logging
 import os
 import re
 import traceback
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -113,6 +114,13 @@ def fit_embed(embed: discord.Embed) -> discord.Embed:
         for field in original_fields[:6]:
             embed.add_field(name=short(field.name, 150), value=short(field.value, 600), inline=field.inline)
     return embed
+
+
+def change_summary_lines(added: list[str], removed: list[str], modified: list[str], limit: int = 40) -> str:
+    lines = [*(f"+ {value}" for value in added), *(f"- {value}" for value in removed), *(f"~ {value}" for value in modified)]
+    if len(lines) > limit:
+        lines = lines[:limit] + [f"... and {len(lines) - limit} more changes"]
+    return "\n".join(lines) or "No line-level changes detected."
 
 
 class StateStore:
@@ -291,11 +299,11 @@ class DiscordPoster:
             rows.append(f"{key}: #{name} - {status}")
         return rows
 
-    async def send(self, post: Post) -> None:
+    async def send(self, post: Post) -> bool:
         channel = self.find_channel(post.channel_key)
         if channel is None:
             logging.warning("Missing Discord channel for %s", post.channel_key)
-            return
+            return False
 
         files = post.files or []
         try:
@@ -303,6 +311,7 @@ class DiscordPoster:
         finally:
             for file in files:
                 file.close()
+        return True
 
     async def seen_commit_shas(self, key: str, limit: int = MAX_LOOKBACK_COMMITS + 100) -> set[str]:
         """Read recent messages so manual replay can repair deleted/missing posts."""
@@ -571,18 +580,12 @@ class GithubFileTracker(CommitTracker):
             color = ROBLOX_GREEN if added and not removed else 0xE74C3C if removed and not added else 0xF1C40F
             embed = discord.Embed(
                 title=f"{file_name} Update Detected",
-                description="A new commit updated this tracked file. The snapshot is attached below.",
+                description=code_block(change_summary_lines(added, removed, modified), "diff"),
                 color=color,
                 url=detail.get("html_url"),
                 timestamp=datetime.now(timezone.utc),
             )
-            embed.add_field(name="Changes", value=f"🟢 Added: **{len(added)}**  🔴 Removed: **{len(removed)}**  🟡 Modified: **{len(modified)}**", inline=False)
-            if added:
-                embed.add_field(name="🟢 Added", value=short("\n".join(f"`{value}`" for value in added[:15]), 1024), inline=False)
-            if removed:
-                embed.add_field(name="🔴 Removed", value=short("\n".join(f"`{value}`" for value in removed[:15]), 1024), inline=False)
-            if modified:
-                embed.add_field(name="🟡 Modified", value=short("\n".join(f"`{value}`" for value in modified[:15]), 1024), inline=False)
+            embed.add_field(name="Changes", value=f"+ {len(added)} added  - {len(removed)} removed  ~ {len(modified)} modified", inline=False)
             embed.add_field(name="Commit", value=f"`{sha[:12]}`", inline=True)
             embed.add_field(name="Source", value=f"[Roblox-Client-Tracker]({detail.get('html_url')})", inline=False)
             embed.set_footer(text=f"commit:{sha}")
@@ -621,15 +624,12 @@ class DeploymentTracker(Tracker):
             return []
         embed = discord.Embed(
             title="🚀 Roblox Deployment Update",
-            description="A new Roblox deployment was published.",
+            description=code_block(change_summary_lines(added, removed, []), "diff"),
             color=ROBLOX_GREEN if added and not removed else 0xE74C3C,
             url=DEPLOY_HISTORY_URL,
             timestamp=datetime.now(timezone.utc),
         )
-        if added:
-            embed.add_field(name="🟢 New deployments", value=short("\n".join(added[-15:]), 1024), inline=False)
-        if removed:
-            embed.add_field(name="🔴 Removed/reverted entries", value=short("\n".join(removed[-15:]), 1024), inline=False)
+        embed.add_field(name="Changes", value=f"+ {len(added)} added  - {len(removed)} removed", inline=False)
         embed.add_field(name="Source", value=f"[DeployHistory.txt]({DEPLOY_HISTORY_URL})", inline=False)
         return [Post(self.channel_key, embed)]
 
@@ -740,7 +740,10 @@ class RobloxTrackerBot(commands.Bot):
             await interaction.response.send_message("The bot is still starting up; try again in a moment.", ephemeral=True)
             return
         await interaction.response.defer(ephemeral=True, thinking=True)
-        counts = await self.send_missing_updates()
+        async def progress(message: str) -> None:
+            await interaction.edit_original_response(content=f"⏳ {message}")
+
+        counts = await self.send_missing_updates(progress)
         total = sum(counts.values())
         details = ", ".join(f"{name}: {count}" for name, count in counts.items())
         await interaction.followup.send(
@@ -812,16 +815,16 @@ class RobloxTrackerBot(commands.Bot):
                 for post in posts:
                     sent = False
                     try:
-                        await self.poster.send(post)
-                        sent = True
-                        if isinstance(tracker, FFlagTracker):
-                            counts["FastFlags"] += 1
-                        elif isinstance(tracker, ApiDumpTracker):
-                            counts["API dumps"] += 1
-                        elif isinstance(tracker, CppTreeTracker):
-                            counts["CppTree"] += 1
-                        elif isinstance(tracker, DeploymentTracker):
-                            counts["Deployments"] += 1
+                        sent = await self.poster.send(post)
+                        if sent:
+                            if isinstance(tracker, FFlagTracker):
+                                counts["FastFlags"] += 1
+                            elif isinstance(tracker, ApiDumpTracker):
+                                counts["API dumps"] += 1
+                            elif isinstance(tracker, CppTreeTracker):
+                                counts["CppTree"] += 1
+                            elif isinstance(tracker, DeploymentTracker):
+                                counts["Deployments"] += 1
                     except Exception:
                         # A single bad embed/send should not stop the rest of the
                         # batch, and definitely should not kill the poll loop.
@@ -831,19 +834,31 @@ class RobloxTrackerBot(commands.Bot):
                         await asyncio.sleep(0.4)
         return counts
 
-    async def send_missing_updates(self) -> dict[str, int]:
+    async def send_missing_updates(self, progress: Callable[[str], Awaitable[None]] | None = None) -> dict[str, int]:
         """Repair channels from recent source history without trusting cursors."""
         assert self.poster is not None
         counts = {"FastFlags": 0, "API dumps": 0, "CppTree": 0, "Deployments": 0}
         async with self.update_lock:
             for tracker in self.build_trackers():
                 try:
+                    source_name = {
+                        FFlagTracker: "FastFlags",
+                        ApiDumpTracker: "API dumps",
+                        CppTreeTracker: "CppTree",
+                        DeploymentTracker: "Deployments",
+                    }.get(type(tracker), tracker.__class__.__name__)
+                    if progress:
+                        await progress(f"Checking {source_name} channel history...")
                     if isinstance(tracker, CommitTracker):
                         seen = await self.poster.seen_commit_shas(tracker.channel_key)
                         candidates = await tracker.recent_commits(MANUAL_REPLAY_COMMITS)
                         commits = [item for item in candidates if item["sha"][:12] not in seen]
+                        if progress:
+                            await progress(f"{source_name}: found {len(commits)} missing of the latest {len(candidates)} commits; preparing updates...")
                         posts = await tracker.run(commits)
                     else:
+                        if progress:
+                            await progress(f"{source_name}: checking the latest deployment history...")
                         posts = await tracker.run()
                 except GithubRateLimited as exc:
                     logging.warning("%s skipped: %s", tracker.__class__.__name__, exc)
@@ -854,20 +869,22 @@ class RobloxTrackerBot(commands.Bot):
                 for post in posts:
                     sent = False
                     try:
-                        await self.poster.send(post)
-                        sent = True
-                        if isinstance(tracker, FFlagTracker):
-                            counts["FastFlags"] += 1
-                        elif isinstance(tracker, ApiDumpTracker):
-                            counts["API dumps"] += 1
-                        elif isinstance(tracker, CppTreeTracker):
-                            counts["CppTree"] += 1
-                        elif isinstance(tracker, DeploymentTracker):
-                            counts["Deployments"] += 1
+                        sent = await self.poster.send(post)
+                        if sent:
+                            if isinstance(tracker, FFlagTracker):
+                                counts["FastFlags"] += 1
+                            elif isinstance(tracker, ApiDumpTracker):
+                                counts["API dumps"] += 1
+                            elif isinstance(tracker, CppTreeTracker):
+                                counts["CppTree"] += 1
+                            elif isinstance(tracker, DeploymentTracker):
+                                counts["Deployments"] += 1
                     except Exception:
                         logging.exception("Failed to repair a post for %s", tracker.__class__.__name__)
                     if sent:
                         await asyncio.sleep(0.4)
+                if progress:
+                    await progress(f"{source_name}: finished; sent {counts[source_name]} update(s). Moving to the next source...")
         return counts
 
     async def poll_loop(self) -> None:
