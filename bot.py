@@ -669,7 +669,7 @@ class RobloxTrackerBot(commands.Bot):
             f"Found **{len(results)}** matching {platform.name} FastFlags.", file=file, ephemeral=True
         )
 
-    @app_commands.command(name="send-missed-updates", description="Send all missed FastFlag, API dump, and CppTree updates")
+    @app_commands.command(name="send-missed-updates", description="Send all missed FastFlag, API dump, CppTree, and deployment updates")
     @app_commands.guild_only()
     async def send_missed_updates_command(self, interaction: discord.Interaction) -> None:
         if self.poster is None:
