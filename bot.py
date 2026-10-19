@@ -271,6 +271,23 @@ class DiscordPoster:
             for file in files:
                 file.close()
 
+    async def seen_commit_shas(self, key: str, limit: int = MAX_LOOKBACK_COMMITS + 100) -> set[str]:
+        """Read recent messages so manual replay can repair deleted/missing posts."""
+        channel = self.find_channel(key)
+        if channel is None:
+            return set()
+        seen: set[str] = set()
+        async for message in channel.history(limit=limit):
+            for embed in message.embeds:
+                if embed.footer.text and embed.footer.text.startswith("commit:"):
+                    seen.add(embed.footer.text.removeprefix("commit:")[:12])
+                if embed.url and "/commit/" in embed.url:
+                    seen.add(embed.url.rsplit("/", 1)[-1][:12])
+                for field in embed.fields:
+                    if field.name == "Commit":
+                        seen.add(str(field.value).strip("`")[:12])
+        return seen
+
 
 class Tracker:
     def __init__(self, state: StateStore, http: Http, github: Github) -> None:
@@ -346,6 +363,18 @@ class CommitTracker(Tracker):
         self.state.set(self.key, latest)
         return list(reversed(collected))
 
+    async def recent_commits(self, limit: int = MAX_LOOKBACK_COMMITS) -> list[dict[str, Any]]:
+        """Return recent commits without changing the saved cursor."""
+        collected: list[dict[str, Any]] = []
+        page_num = 1
+        while len(collected) < limit:
+            page = await self.github.commits(self.repo, self.branch, per_page=100, path=self.path or None, page=page_num)
+            if not page:
+                break
+            collected.extend(page)
+            page_num += 1
+        return list(reversed(collected[:limit]))
+
 
 # Every individual flag/int/string/log variable gets its own metadata file at
 # FVariables/{Prefix}/{FirstLetterOfCoreName}/{FullName}.json in the FFlag
@@ -391,9 +420,9 @@ class FFlagTracker(CommitTracker):
     channel_key = "flags"
     path = "FVariables"
 
-    async def run(self) -> list[Post]:
+    async def run(self, commits: list[dict[str, Any]] | None = None) -> list[Post]:
         posts: list[Post] = []
-        for item in await self.changed_commits():
+        for item in commits if commits is not None else await self.changed_commits():
             sha = item["sha"]
             detail = await self.github.commit(self.repo, sha)
             fvar_files = [f for f in detail.get("files", []) if f.get("filename", "").startswith("FVariables/")]
@@ -445,6 +474,7 @@ class FFlagTracker(CommitTracker):
             embed.add_field(name="Roblox Version", value=f"`{roblox_version}`", inline=True)
             embed.add_field(name="Commit", value=f"`{sha[:12]}`", inline=True)
             embed.add_field(name="Source", value=f"[Roblox-FFlag-Tracker]({detail.get('html_url')})", inline=False)
+            embed.set_footer(text=f"commit:{sha}")
 
             full_patch = "\n".join(f"diff -- {f.get('filename')}\n{f.get('patch', '')}" for f in fvar_files if f.get("patch"))
             diff_file = make_text_file(f"fflags_{sha[:12]}.diff", full_patch) if full_patch else None
@@ -488,9 +518,9 @@ class GithubFileTracker(CommitTracker):
             text += f"\n…and {len(values) - len(shown)} more"
         return f"{emoji} **{name} ({len(values)})**\n{text}"
 
-    async def run(self) -> list[Post]:
+    async def run(self, commits: list[dict[str, Any]] | None = None) -> list[Post]:
         posts: list[Post] = []
-        for item in await self.changed_commits():
+        for item in commits if commits is not None else await self.changed_commits():
             sha = item["sha"]
             detail = await self.github.commit(self.repo, sha)
             touched = any(file.get("filename") == self.path for file in detail.get("files", []))
@@ -522,6 +552,7 @@ class GithubFileTracker(CommitTracker):
                 embed.add_field(name="🟡 Modified", value=short("\n".join(f"`{value}`" for value in modified[:15]), 1024), inline=False)
             embed.add_field(name="Commit", value=f"`{sha[:12]}`", inline=True)
             embed.add_field(name="Source", value=f"[Roblox-Client-Tracker]({detail.get('html_url')})", inline=False)
+            embed.set_footer(text=f"commit:{sha}")
             posts.append(Post(self.channel_key, embed, [attachment]))
         return posts
 
@@ -676,7 +707,7 @@ class RobloxTrackerBot(commands.Bot):
             await interaction.response.send_message("The bot is still starting up; try again in a moment.", ephemeral=True)
             return
         await interaction.response.defer(ephemeral=True, thinking=True)
-        counts = await self.poll_once()
+        counts = await self.send_missing_updates()
         total = sum(counts.values())
         details = ", ".join(f"{name}: {count}" for name, count in counts.items())
         await interaction.followup.send(
@@ -761,6 +792,42 @@ class RobloxTrackerBot(commands.Bot):
                         # batch, and definitely should not kill the poll loop.
                         logging.exception("Failed to send a post for %s", tracker.__class__.__name__)
                     # Discord's per-channel bucket is ~5 messages / 5 seconds.
+                    await asyncio.sleep(0.4)
+        return counts
+
+    async def send_missing_updates(self) -> dict[str, int]:
+        """Repair channels from recent source history without trusting cursors."""
+        assert self.poster is not None
+        counts = {"FastFlags": 0, "API dumps": 0, "CppTree": 0, "Deployments": 0}
+        async with self.update_lock:
+            for tracker in self.build_trackers():
+                try:
+                    if isinstance(tracker, CommitTracker):
+                        seen = await self.poster.seen_commit_shas(tracker.channel_key)
+                        candidates = await tracker.recent_commits()
+                        commits = [item for item in candidates if item["sha"][:12] not in seen]
+                        posts = await tracker.run(commits)
+                    else:
+                        posts = await tracker.run()
+                except GithubRateLimited as exc:
+                    logging.warning("%s skipped: %s", tracker.__class__.__name__, exc)
+                    continue
+                except Exception:
+                    logging.exception("%s missed-update repair failed", tracker.__class__.__name__)
+                    continue
+                for post in posts:
+                    try:
+                        await self.poster.send(post)
+                        if isinstance(tracker, FFlagTracker):
+                            counts["FastFlags"] += 1
+                        elif isinstance(tracker, ApiDumpTracker):
+                            counts["API dumps"] += 1
+                        elif isinstance(tracker, CppTreeTracker):
+                            counts["CppTree"] += 1
+                        elif isinstance(tracker, DeploymentTracker):
+                            counts["Deployments"] += 1
+                    except Exception:
+                        logging.exception("Failed to repair a post for %s", tracker.__class__.__name__)
                     await asyncio.sleep(0.4)
         return counts
 

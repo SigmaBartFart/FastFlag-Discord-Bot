@@ -10,7 +10,7 @@ Tracks Roblox FastFlag changes and Roblox Client Tracker commits, with slash com
 - Watches `API-Dump.json` and `CppTree.txt` in `MaximumADHD/Roblox-Client-Tracker` on the `roblox` branch.
 - `/setup` asks for FastFlag, API dump, CppTree, and deployment channels and saves the selected channel IDs per server.
 - `/flagsearch` takes `Client` or `Studio` plus a keyword, combines all relevant Roblox settings endpoints, and returns a private JSON attachment.
-- `/send-missed-updates` immediately delivers all commits missed by the saved per-source cursors, then records those commits as processed. It is safe to use while the normal polling loop is running.
+- `/send-missed-updates` repairs the destination channels by checking recent channel history for commit IDs, then resends source updates that are not actually present. It does not rely only on the saved cursors, so it can restore messages that were deleted or missed while a channel was unavailable.
 - Deployment updates come from `https://setup.rbxcdn.com/DeployHistory.txt` and are shown in a dedicated webhook-style embed with green new entries and red removed/reverted entries.
 
 ### Catching up after being offline
